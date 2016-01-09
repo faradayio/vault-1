@@ -1777,6 +1777,177 @@ func TestCore_HandleRequest_MountPoint(t *testing.T) {
 	}
 }
 
+func TestCore_RootGeneration_Lifecycle(t *testing.T) {
+	c, master, _ := TestCoreUnsealed(t)
+
+	// Verify update not allowed
+	if _, err := c.RootGenerationUpdate(master, ""); err == nil {
+		t.Fatalf("no root generation in progress")
+	}
+
+	// Should be no progress
+	num, err := c.RootGenerationProgress()
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if num != 0 {
+		t.Fatalf("bad: %d", num)
+	}
+
+	// Should be no config
+	conf, err := c.RootGenerationConfiguration()
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if conf != nil {
+		t.Fatalf("bad: %v", conf)
+	}
+
+	// Cancel should be idempotent
+	err = c.RootGenerationCancel()
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Start a root generation
+	err = c.RootGenerationInit("asdf")
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Should get config
+	conf, err = c.RootGenerationConfiguration()
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Cancel should be clear
+	err = c.RootGenerationCancel()
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Should be no config
+	conf, err = c.RootGenerationConfiguration()
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if conf != nil {
+		t.Fatalf("bad: %v", conf)
+	}
+}
+
+func TestCore_RootGeneration_Init(t *testing.T) {
+	c, _, _ := TestCoreUnsealed(t)
+
+	err := c.RootGenerationInit("asdf")
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Second should fail
+	err = c.RootGenerationInit("asdf")
+	if err == nil {
+		t.Fatalf("should fail")
+	}
+}
+
+func TestCore_RootGeneration_Update(t *testing.T) {
+	c, master, _ := TestCoreUnsealed(t)
+
+	// Start a root generation
+	err := c.RootGenerationInit("asdf")
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Fetch new config with generated nonce
+	rkconf, err := c.RootGenerationConfiguration()
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if rkconf == nil {
+		t.Fatalf("bad: no root generation config received")
+	}
+
+	// Provide the master
+	result, err := c.RootGenerationUpdate(master, rkconf.Nonce)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if result == nil {
+		t.Fatalf("Bad, result is nil")
+	}
+
+	// Should be no progress
+	num, err := c.RootGenerationProgress()
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if num != 0 {
+		t.Fatalf("bad: %d", num)
+	}
+
+	// Should be no config
+	conf, err := c.RootGenerationConfiguration()
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if conf != nil {
+		t.Fatalf("bad: %v", conf)
+	}
+
+	// Ensure that the "asdf" token is now a root token
+	te, err := c.tokenStore.Lookup("asdf")
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if te.ID != "asdf" || te.Parent != "" ||
+		len(te.Policies) != 1 || te.Policies[0] != "root" {
+		t.Fatalf("bad: %#v", *te)
+	}
+}
+
+func TestCore_RootGeneration_InvalidMaster(t *testing.T) {
+	c, master, _ := TestCoreUnsealed(t)
+
+	err := c.RootGenerationInit("asdf")
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Fetch new config with generated nonce
+	rkconf, err := c.RootGenerationConfiguration()
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if rkconf == nil {
+		t.Fatalf("bad: no rekey config received")
+	}
+
+	// Provide the master (invalid)
+	master[0]++
+	_, err = c.RootGenerationUpdate(master, rkconf.Nonce)
+	if err == nil {
+		t.Fatalf("expected error")
+	}
+}
+
+func TestCore_RootGeneration_InvalidNonce(t *testing.T) {
+	c, master, _ := TestCoreUnsealed(t)
+
+	err := c.RootGenerationInit("asdf")
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Provide the nonce (invalid)
+	_, err = c.RootGenerationUpdate(master, "abcd")
+	if err == nil {
+		t.Fatalf("expected error")
+	}
+}
+
 func TestCore_Rekey_Lifecycle(t *testing.T) {
 	c, master, _ := TestCoreUnsealed(t)
 

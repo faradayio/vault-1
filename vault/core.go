@@ -157,6 +157,20 @@ func (s *SealConfig) Validate() error {
 	return nil
 }
 
+// RootGenerationConfig holds the configuration for a root generation
+// command.
+type RootGenerationConfig struct {
+	Nonce string
+	Token string
+}
+
+// RootGenerationResult holds the result of a root generation update
+// command
+type RootGenerationResult struct {
+	Progress int
+	Required int
+}
+
 // InitResult is used to provide the key parts back after
 // they are generated as part of the initialization.
 type InitResult struct {
@@ -227,6 +241,12 @@ type Core struct {
 	// unlockParts has the keys provided to Unseal until
 	// the threshold number of parts is available.
 	unlockParts [][]byte
+
+	// rootGenerationProgress holds the shares until we reach enough
+	// to verify the master key
+	rootGenerationConfig   *RootGenerationConfig
+	rootGenerationProgress [][]byte
+	rootGenerationLock     sync.Mutex
 
 	// rekeyProgress holds the shares we have until we reach enough
 	// to verify the master key.
@@ -880,7 +900,7 @@ func (c *Core) Initialize(config *SealConfig) (*InitResult, error) {
 	}
 
 	// Generate a new root token
-	rootToken, err := c.tokenStore.rootToken()
+	rootToken, err := c.tokenStore.rootToken("")
 	if err != nil {
 		c.logger.Printf("[ERR] core: root token generation failed: %v", err)
 		return nil, err
@@ -1165,6 +1185,213 @@ func (c *Core) sealInternal() error {
 		return err
 	}
 	c.logger.Printf("[INFO] core: vault is sealed")
+	return nil
+}
+
+// RootGeneration is used to return the root generation progress (num shares)
+func (c *Core) RootGenerationProgress() (int, error) {
+	c.stateLock.RLock()
+	defer c.stateLock.RUnlock()
+	if c.sealed {
+		return 0, ErrSealed
+	}
+	if c.standby {
+		return 0, ErrStandby
+	}
+
+	c.rootGenerationLock.Lock()
+	defer c.rootGenerationLock.Unlock()
+
+	return len(c.rootGenerationProgress), nil
+}
+
+// RootGenerationConfig is used to read the root generation configuration
+// It stubbornly refuses to return the token.
+func (c *Core) RootGenerationConfiguration() (*RootGenerationConfig, error) {
+	c.stateLock.RLock()
+	defer c.stateLock.RUnlock()
+	if c.sealed {
+		return nil, ErrSealed
+	}
+	if c.standby {
+		return nil, ErrStandby
+	}
+
+	c.rootGenerationLock.Lock()
+	defer c.rootGenerationLock.Unlock()
+
+	// Copy the config if any
+	var conf *RootGenerationConfig
+	if c.rootGenerationConfig != nil {
+		conf = new(RootGenerationConfig)
+		*conf = *c.rootGenerationConfig
+		conf.Token = ""
+	}
+	return conf, nil
+}
+
+// RootGenerationInit is used to initialize the root generation settings
+func (c *Core) RootGenerationInit(token string) error {
+	if token == "" {
+		return fmt.Errorf("desired token cannot be empty")
+	}
+
+	c.stateLock.RLock()
+	defer c.stateLock.RUnlock()
+	if c.sealed {
+		return ErrSealed
+	}
+	if c.standby {
+		return ErrStandby
+	}
+
+	c.rootGenerationLock.Lock()
+	defer c.rootGenerationLock.Unlock()
+
+	// Prevent multiple concurrent root generations
+	if c.rootGenerationConfig != nil {
+		return fmt.Errorf("root generation already in progress")
+	}
+
+	// Copy the configuration
+	c.rootGenerationConfig = &RootGenerationConfig{
+		Nonce: uuid.GenerateUUID(),
+		Token: token,
+	}
+
+	c.logger.Printf("[INFO] core: root generation initialized (nonce: %s)",
+		c.rootGenerationConfig.Nonce)
+	return nil
+}
+
+// RootGenerationUpdate is used to provide a new key part
+func (c *Core) RootGenerationUpdate(key []byte, nonce string) (*RootGenerationResult, error) {
+	// Verify the key length
+	min, max := c.barrier.KeyLength()
+	max += shamir.ShareOverhead
+	if len(key) < min {
+		return nil, &ErrInvalidKey{fmt.Sprintf("key is shorter than minimum %d bytes", min)}
+	}
+	if len(key) > max {
+		return nil, &ErrInvalidKey{fmt.Sprintf("key is longer than maximum %d bytes", max)}
+	}
+
+	// Get the seal configuration
+	config, err := c.SealConfig()
+	if err != nil {
+		return nil, err
+	}
+
+	// Ensure the barrier is initialized
+	if config == nil {
+		return nil, ErrNotInit
+	}
+
+	// Ensure we are already unsealed
+	c.stateLock.RLock()
+	defer c.stateLock.RUnlock()
+	if c.sealed {
+		return nil, ErrSealed
+	}
+	if c.standby {
+		return nil, ErrStandby
+	}
+
+	c.rootGenerationLock.Lock()
+	defer c.rootGenerationLock.Unlock()
+
+	// Ensure a rootGeneration is in progress
+	if c.rootGenerationConfig == nil {
+		return nil, fmt.Errorf("no root generation in progress")
+	}
+
+	if nonce != c.rootGenerationConfig.Nonce {
+		return nil, fmt.Errorf("incorrect nonce supplied; nonce for this root generation operation is %s", c.rootGenerationConfig.Nonce)
+	}
+
+	// Check if we already have this piece
+	for _, existing := range c.rootGenerationProgress {
+		if bytes.Equal(existing, key) {
+			return nil, nil
+		}
+	}
+
+	// Store this key
+	c.rootGenerationProgress = append(c.rootGenerationProgress, key)
+	progress := len(c.rootGenerationProgress)
+
+	// Check if we don't have enough keys to unlock
+	if len(c.rootGenerationProgress) < config.SecretThreshold {
+		c.logger.Printf("[DEBUG] core: cannot generate root, have %d of %d keys",
+			progress, config.SecretThreshold)
+		return &RootGenerationResult{
+			Progress: progress,
+			Required: config.SecretThreshold,
+		}, nil
+	}
+
+	// Recover the master key
+	var masterKey []byte
+	if config.SecretThreshold == 1 {
+		masterKey = c.rootGenerationProgress[0]
+		c.rootGenerationProgress = nil
+	} else {
+		masterKey, err = shamir.Combine(c.rootGenerationProgress)
+		c.rootGenerationProgress = nil
+		if err != nil {
+			return nil, fmt.Errorf("failed to compute master key: %v", err)
+		}
+	}
+
+	// Verify the master key
+	if err := c.barrier.VerifyMaster(masterKey); err != nil {
+		c.logger.Printf("[ERR] core: root generation aborted, master key verification failed: %v", err)
+		return nil, err
+	}
+
+	// Everything is good -- promote the token (remove if it exists, and
+	// generate as root)
+
+	// If the token ID already exists, revoke it
+	err = c.tokenStore.Revoke(c.rootGenerationConfig.Token)
+	if err != nil {
+		c.logger.Printf("[ERR] core: root generation aborted, could not revoke previous token: %v", err)
+		return nil, err
+	}
+
+	_, err = c.tokenStore.rootToken(c.rootGenerationConfig.Token)
+	if err != nil {
+		c.logger.Printf("[ERR] core: root token generation failed: %v", err)
+		return nil, err
+	}
+
+	results := &RootGenerationResult{
+		Progress: progress,
+		Required: config.SecretThreshold,
+	}
+
+	c.rootGenerationProgress = nil
+	c.rootGenerationConfig = nil
+	return results, nil
+}
+
+// RootGenerationCancel is used to cancel an in-progress root generation
+func (c *Core) RootGenerationCancel() error {
+	c.stateLock.RLock()
+	defer c.stateLock.RUnlock()
+	if c.sealed {
+		return ErrSealed
+	}
+	if c.standby {
+		return ErrStandby
+	}
+
+	c.rootGenerationLock.Lock()
+	defer c.rootGenerationLock.Unlock()
+
+	// Clear any progress or config
+	c.rootGenerationConfig = nil
+	c.rootGenerationProgress = nil
 	return nil
 }
 
