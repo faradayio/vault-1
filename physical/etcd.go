@@ -306,6 +306,7 @@ func (c *EtcdBackend) LockWith(key, value string) (Lock, error) {
 		kAPI:            c.kAPI,
 		value:           value,
 		semaphoreDirKey: c.nodePathLock(key),
+		logger:          c.logger,
 	}, nil
 }
 
@@ -314,6 +315,7 @@ type EtcdLock struct {
 	kAPI                                 client.KeysAPI
 	value, semaphoreDirKey, semaphoreKey string
 	lock                                 sync.Mutex
+	logger                               *log.Logger
 }
 
 // addSemaphoreKey acquires a new ordered semaphore key.
@@ -327,6 +329,7 @@ func (c *EtcdLock) addSemaphoreKey() (string, uint64, error) {
 	}
 	response, err := c.kAPI.CreateInOrder(context.Background(), c.semaphoreDirKey, c.value, opts)
 	if err != nil {
+		c.logger.Printf("[ERROR] etcd: couldn't create key in %s: %v", c.semaphoreDirKey, err)
 		return "", 0, err
 	}
 	return response.Node.Key, response.Index, nil
@@ -340,6 +343,7 @@ func (c *EtcdLock) renewSemaphoreKey() (string, uint64, error) {
 	}
 	response, err := c.kAPI.Set(context.Background(), c.semaphoreKey, c.value, setOpts)
 	if err != nil {
+		c.logger.Printf("[ERROR] etcd: couldn't renew key %s: %v", c.semaphoreKey, err)
 		return "", 0, err
 	}
 	return response.Node.Key, response.Index, nil
@@ -435,13 +439,17 @@ func (c *EtcdLock) watchForKeyRemoval(key string, etcdIndex uint64, closeCh chan
 
 			// If the key is just missing, we can exit the loop.
 			if errorIsMissingKey(err) {
+				c.logger.Printf("[DEBUG] etcd: key %s is missing", key)
 				break
 			}
+
+			c.logger.Printf("[ERROR] etcd: key %s error: %v", key, err)
 
 			// If the error is something else, there's nothing we can do but retry
 			// the watch. Check that we still have retries left.
 			retries -= 1
 			if retries == 0 {
+				c.logger.Printf("[ERROR] etcd: key %s retried too many times", key)
 				break
 			}
 
@@ -454,6 +462,7 @@ func (c *EtcdLock) watchForKeyRemoval(key string, etcdIndex uint64, closeCh chan
 		// can exit the loop.
 		if response.Node.Key == key &&
 			(response.Action == "delete" || response.Action == "expire") {
+			c.logger.Printf("[DEBUG] etcd: key %s removed: %s", key, response.Action)
 			break
 		}
 

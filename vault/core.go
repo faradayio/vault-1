@@ -510,6 +510,7 @@ func (c *Core) Leader() (isLeader bool, leaderAddr string, err error) {
 	// Initialize a lock
 	lock, err := c.ha.LockWith(coreLockPath, "read")
 	if err != nil {
+		c.logger.Printf("[ERROR] core: unable to determine leader: %v", err)
 		return false, "", err
 	}
 
