@@ -14,9 +14,9 @@ import (
 // prefix within Etcd. It is used for most production situations as
 // it allows Vault to run on multiple machines in a highly-available manner.
 type RedisBackend struct {
-	path       string
-	conn       *redis.Conn
-	logger     *log.Logger
+	path   string
+	conn   *redis.Conn
+	logger *log.Logger
 }
 
 func newRedisBackend(conf map[string]string, logger *log.Logger) (Backend, error) {
@@ -74,7 +74,7 @@ func (c *RedisBackend) Get(key string) (*Entry, error) {
 	}
 
 	return &Entry{
-		Key: key,
+		Key:   key,
 		Value: value,
 	}, nil
 }
@@ -92,19 +92,19 @@ func (c *RedisBackend) List(prefix string) ([]string, error) {
 	if !strings.HasSuffix(realPrefix, "/") {
 		realPrefix += "/"
 	}
-	
+
 	// Ask Redis to list all keys beneath our prefix.  Note that this
 	// is not terribly efficient if you have a lot of keys, but we hope
 	// it's not a common operating.  There are more complex APIs for
 	// doing this incrementally.
-	reply, err := (*c.conn).Do("KEYS", realPrefix + "*")
+	reply, err := (*c.conn).Do("KEYS", realPrefix+"*")
 	matches, err := redis.Strings(reply, err)
 
 	// TODO - Don't recurse subdirectories.  This means stripping
 	// everything after "/" and removing duplicates.
 	results := make([]string, 0)
 	dirs := make(map[string]bool)
-	for _, match := range(matches) {
+	for _, match := range matches {
 		// Remove the path that we were querying from the results.
 		match = strings.TrimPrefix(match, realPrefix)
 
@@ -114,7 +114,7 @@ func (c *RedisBackend) List(prefix string) ([]string, error) {
 			results = append(results, match)
 		} else {
 			// Keep the trailing slash.
-			dir := match[0:slashPos+1]
+			dir := match[0 : slashPos+1]
 
 			// Have we seen this directory already?  If not,
 			// return it and mark it as seen.

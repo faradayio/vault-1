@@ -6,7 +6,6 @@ import (
 	"os"
 	"testing"
 	"time"
-
 	//"github.com/garyburd/redigo/redis"
 	//"golang.org/x/net/context"
 )
