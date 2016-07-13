@@ -1,7 +1,6 @@
 package physical
 
 import (
-	"encoding/base64"
 	"fmt"
 	"log"
 	"os"
@@ -68,13 +67,15 @@ func newRedisBackend(conf map[string]string, logger *log.Logger) (Backend, error
 	}, nil
 }
 
+func (c *RedisBackend) keyPath(key string) string {
+	return fmt.Sprintf("%s/data/%s", c.path, key)
+}
+
 func (c *RedisBackend) Put(entry *Entry) error {
 	conn := c.pool.Get()
 	defer conn.Close()
 
-	encoded := base64.StdEncoding.EncodeToString(entry.Value)
-	realKey := fmt.Sprintf("%s/data/%s", c.path, entry.Key)
-	_, err := conn.Do("SET", realKey, encoded)
+	_, err := conn.Do("SET", c.keyPath(entry.Key), entry.Value)
 	return err
 }
 
@@ -82,7 +83,7 @@ func (c *RedisBackend) Get(key string) (*Entry, error) {
 	conn := c.pool.Get()
 	defer conn.Close()
 
-	reply, err := conn.Do("GET", fmt.Sprintf("%s/data/%s", c.path, key))
+	reply, err := conn.Do("GET", c.keyPath(key))
 	if err != nil {
 		return nil, err
 	}
@@ -91,19 +92,14 @@ func (c *RedisBackend) Get(key string) (*Entry, error) {
 		return nil, nil
 	}
 
-	replyStr, err := redis.String(reply, err)
-	if err != nil {
-		return nil, err
-	}
-
-	value, err := base64.StdEncoding.DecodeString(replyStr)
+	value, err := redis.String(reply, err)
 	if err != nil {
 		return nil, err
 	}
 
 	return &Entry{
 		Key:   key,
-		Value: value,
+		Value: []byte(value),
 	}, nil
 }
 
@@ -111,7 +107,7 @@ func (c *RedisBackend) Delete(key string) error {
 	conn := c.pool.Get()
 	defer conn.Close()
 
-	_, err := conn.Do("DEL", fmt.Sprintf("%s/data/%s", c.path, key))
+	_, err := conn.Do("DEL", c.keyPath(key))
 	return err
 }
 
@@ -122,7 +118,7 @@ func (c *RedisBackend) List(prefix string) ([]string, error) {
 	// Construct a "directory"-style name with a trailing slash from
 	// `prefix`.  But`prefix` may be the empty string, so be careful
 	// how we add "/".
-	realPrefix := fmt.Sprintf("%s/data/%s", c.path, prefix)
+	realPrefix := c.keyPath(prefix)
 	if !strings.HasSuffix(realPrefix, "/") {
 		realPrefix += "/"
 	}
@@ -171,6 +167,9 @@ func (c *RedisBackend) LockWith(key, value string) (Lock, error) {
 	}, nil
 }
 
+// A lock implemented using Redis.  This is based on the single-Redis
+// example code used to explain Redlock at http://redis.io/topics/distlock
+// but it might be useful to upgrade this to a full Redlock implementation.
 type RedisLock struct {
 	key    string
 	value  string
