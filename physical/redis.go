@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/garyburd/redigo/redis"
 )
@@ -130,7 +131,7 @@ func (c *RedisBackend) List(prefix string) ([]string, error) {
 
 func (c *RedisBackend) LockWith(key, value string) (Lock, error) {
 	return &RedisLock{
-		key:   key,
+		key:   fmt.Sprintf("%s/_lock/%s", c.path, key),
 		value: value,
 		conn:  c.conn,
 	}, nil
@@ -143,7 +144,43 @@ type RedisLock struct {
 }
 
 func (c *RedisLock) Lock(stopCh <-chan struct{}) (<-chan struct{}, error) {
-	return nil, fmt.Errorf("RedisLock Lock unimplemented")
+	// Loop until we get a non-nil reply from Redis indicating a
+	// successful operation.
+	var reply interface{}
+	for reply == nil {
+		// Attempt to set our key.  "NX" means to only set the key
+		// if it does not exist, and "PX" specifies a timeout in
+		// milliseconds.
+		reply, err := (*c.conn).Do("SET", c.key, c.value, "NX", "PX", "30000")
+		if err != nil {
+			// We got an error communicating with Redis, so
+			// fail outright.
+			return nil, err
+		}
+		if reply != nil {
+			// We got back a non-nil response, which means we
+			// set the key and can stop looping.
+			break
+		}
+
+		// Create a timeout channel that will send a message after
+		// 5 seconds.
+		timeout := make(chan bool, 1)
+		go func() {
+			time.Sleep(5 * time.Second)
+			timeout <- true
+		}()
+
+		select {
+		case <-stopCh:
+			// Lock acquisition was cancelled by our caller.
+			return nil, nil
+		case <-timeout:
+			// Timeout fired, so here we go again.
+		}
+	}
+
+	return make(chan struct{}), nil
 }
 
 func (c *RedisLock) Unlock() error {
@@ -151,7 +188,19 @@ func (c *RedisLock) Unlock() error {
 }
 
 func (c *RedisLock) Value() (bool, string, error) {
-	return false, "", fmt.Errorf("RedisLock Value unimplemented")
+	reply, err := (*c.conn).Do("GET", c.key)
+	if err != nil {
+		// Could not read value.
+		return false, "", err
+	}
+	if reply == nil {
+		// Nobody is holding the lock.
+		return false, "", nil
+	}
+
+	// Somebody is holding the lock, so report the value.
+	value, err := redis.String(reply, err)
+	return true, value, err
 }
 
 //type Lock interface {
