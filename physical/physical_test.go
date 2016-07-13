@@ -253,7 +253,10 @@ func testHABackend(t *testing.T, b HABackend, b2 HABackend) {
 	}
 
 	// Release the first lock
-	lock.Unlock()
+	err = lock.Unlock()
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
 
 	// Attempt to lock should work
 	leaderCh2, err = lock2.Lock(nil)
@@ -276,5 +279,8 @@ func testHABackend(t *testing.T, b HABackend, b2 HABackend) {
 		t.Fatalf("bad value: %v", err)
 	}
 	// Cleanup
-	lock2.Unlock()
+	err = lock2.Unlock()
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
 }

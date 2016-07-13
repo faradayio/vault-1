@@ -143,6 +143,8 @@ type RedisLock struct {
 	conn  *redis.Conn
 }
 
+// Acquire the lock.  To interrupt lock acquistion, close stopCh.  The
+// returned channel will be closed if the lock is lost.
 func (c *RedisLock) Lock(stopCh <-chan struct{}) (<-chan struct{}, error) {
 	// Loop until we get a non-nil reply from Redis indicating a
 	// successful operation.
@@ -183,10 +185,28 @@ func (c *RedisLock) Lock(stopCh <-chan struct{}) (<-chan struct{}, error) {
 	return make(chan struct{}), nil
 }
 
+// Release the lock.
 func (c *RedisLock) Unlock() error {
-	return fmt.Errorf("RedisLock Unlock unimplemented")
+	unlockScript := redis.NewScript(1, `
+if redis.call("get",KEYS[1]) == ARGV[1] then
+    return redis.call("del",KEYS[1])
+else
+    return 0
+end
+`)
+	reply, err := unlockScript.Do(*c.conn, c.key, c.value)
+	deleted, err := redis.Int(reply, err)
+	if err != nil {
+		return err
+	}
+	if deleted == 0 {
+		// I presume we ought to return an error here.
+		return fmt.Errorf("redis: tried to unlock somebody else's lock")
+	}
+	return nil
 }
 
+// Returns the value of the lock and if it is held.
 func (c *RedisLock) Value() (bool, string, error) {
 	reply, err := (*c.conn).Do("GET", c.key)
 	if err != nil {
