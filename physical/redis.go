@@ -73,7 +73,7 @@ func (c *RedisBackend) Put(entry *Entry) error {
 	defer conn.Close()
 
 	encoded := base64.StdEncoding.EncodeToString(entry.Value)
-	realKey := fmt.Sprintf("%s/%s", c.path, entry.Key)
+	realKey := fmt.Sprintf("%s/data/%s", c.path, entry.Key)
 	_, err := conn.Do("SET", realKey, encoded)
 	return err
 }
@@ -82,7 +82,7 @@ func (c *RedisBackend) Get(key string) (*Entry, error) {
 	conn := c.pool.Get()
 	defer conn.Close()
 
-	reply, err := conn.Do("GET", fmt.Sprintf("%s/%s", c.path, key))
+	reply, err := conn.Do("GET", fmt.Sprintf("%s/data/%s", c.path, key))
 	if err != nil {
 		return nil, err
 	}
@@ -111,7 +111,7 @@ func (c *RedisBackend) Delete(key string) error {
 	conn := c.pool.Get()
 	defer conn.Close()
 
-	_, err := conn.Do("DEL", fmt.Sprintf("%s/%s", c.path, key))
+	_, err := conn.Do("DEL", fmt.Sprintf("%s/data/%s", c.path, key))
 	return err
 }
 
@@ -122,7 +122,7 @@ func (c *RedisBackend) List(prefix string) ([]string, error) {
 	// Construct a "directory"-style name with a trailing slash from
 	// `prefix`.  But`prefix` may be the empty string, so be careful
 	// how we add "/".
-	realPrefix := fmt.Sprintf("%s/%s", c.path, prefix)
+	realPrefix := fmt.Sprintf("%s/data/%s", c.path, prefix)
 	if !strings.HasSuffix(realPrefix, "/") {
 		realPrefix += "/"
 	}
@@ -189,9 +189,9 @@ func (c *RedisLock) Lock(stopCh <-chan struct{}) (<-chan struct{}, error) {
 		defer conn.Close()
 
 		// Attempt to set our key.  "NX" means to only set the key
-		// if it does not exist, and "PX" specifies a timeout in
-		// milliseconds.
-		reply, err := conn.Do("SET", c.key, c.value, "NX", "PX", "30000")
+		// if it does not exist, and "EX" specifies a timeout in
+		// seconds.
+		reply, err := conn.Do("SET", c.key, c.value, "NX", "EX", "30")
 		if err != nil {
 			// We got an error communicating with Redis, so
 			// fail outright.
@@ -225,7 +225,7 @@ func (c *RedisLock) Lock(stopCh <-chan struct{}) (<-chan struct{}, error) {
 		// implemented.
 		bumpTtlScript := redis.NewScript(1, `
 if redis.call("GET", KEYS[1]) == ARGV[1] then
-    return redis.call("EXPIRE", KEYS[1], "30000")
+    return redis.call("EXPIRE", KEYS[1], "30")
 else
     return 0
 end
