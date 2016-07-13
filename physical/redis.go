@@ -16,7 +16,7 @@ import (
 // it allows Vault to run on multiple machines in a highly-available manner.
 type RedisBackend struct {
 	path   string
-	conn   *redis.Conn
+	pool   *redis.Pool
 	logger *log.Logger
 }
 
@@ -34,28 +34,44 @@ func newRedisBackend(conf map[string]string, logger *log.Logger) (Backend, error
 	}
 	addr := strings.TrimPrefix(url, "redis://")
 
-	// Connect to Redis.
-	conn, err := redis.Dial("tcp", addr)
-	if err != nil {
-		return nil, err
+	// Create a Redis connection pool so that we can access Redis from
+	// multiple goroutines in parallel.
+	pool := &redis.Pool{
+		MaxIdle:     2,
+		IdleTimeout: 300 * time.Second,
+		Dial: func() (redis.Conn, error) {
+			conn, err := redis.Dial("tcp", addr)
+			// TODO: Add AUTH here if we want to support it.
+			return conn, err
+		},
+		TestOnBorrow: func(c redis.Conn, t time.Time) error {
+			_, err := c.Do("PING")
+			return err
+		},
 	}
 
 	return &RedisBackend{
 		path:   path,
-		conn:   &conn,
+		pool:   pool,
 		logger: logger,
 	}, nil
 }
 
 func (c *RedisBackend) Put(entry *Entry) error {
+	conn := c.pool.Get()
+	defer conn.Close()
+
 	encoded := base64.StdEncoding.EncodeToString(entry.Value)
 	realKey := fmt.Sprintf("%s/%s", c.path, entry.Key)
-	_, err := (*c.conn).Do("SET", realKey, encoded)
+	_, err := conn.Do("SET", realKey, encoded)
 	return err
 }
 
 func (c *RedisBackend) Get(key string) (*Entry, error) {
-	reply, err := (*c.conn).Do("GET", fmt.Sprintf("%s/%s", c.path, key))
+	conn := c.pool.Get()
+	defer conn.Close()
+
+	reply, err := conn.Do("GET", fmt.Sprintf("%s/%s", c.path, key))
 	if err != nil {
 		return nil, err
 	}
@@ -81,11 +97,17 @@ func (c *RedisBackend) Get(key string) (*Entry, error) {
 }
 
 func (c *RedisBackend) Delete(key string) error {
-	_, err := (*c.conn).Do("DEL", fmt.Sprintf("%s/%s", c.path, key))
+	conn := c.pool.Get()
+	defer conn.Close()
+
+	_, err := conn.Do("DEL", fmt.Sprintf("%s/%s", c.path, key))
 	return err
 }
 
 func (c *RedisBackend) List(prefix string) ([]string, error) {
+	conn := c.pool.Get()
+	defer conn.Close()
+
 	// Construct a "directory"-style name with a trailing slash from
 	// `prefix`.  But`prefix` may be the empty string, so be careful
 	// how we add "/".
@@ -98,7 +120,7 @@ func (c *RedisBackend) List(prefix string) ([]string, error) {
 	// is not terribly efficient if you have a lot of keys, but we hope
 	// it's not a common operating.  There are more complex APIs for
 	// doing this incrementally.
-	reply, err := (*c.conn).Do("KEYS", realPrefix+"*")
+	reply, err := conn.Do("KEYS", realPrefix+"*")
 	matches, err := redis.Strings(reply, err)
 
 	// TODO - Don't recurse subdirectories.  This means stripping
@@ -131,16 +153,18 @@ func (c *RedisBackend) List(prefix string) ([]string, error) {
 
 func (c *RedisBackend) LockWith(key, value string) (Lock, error) {
 	return &RedisLock{
-		key:   fmt.Sprintf("%s/_lock/%s", c.path, key),
-		value: value,
-		conn:  c.conn,
+		key:    fmt.Sprintf("%s/_lock/%s", c.path, key),
+		value:  value,
+		pool:   c.pool,
+		logger: c.logger,
 	}, nil
 }
 
 type RedisLock struct {
-	key   string
-	value string
-	conn  *redis.Conn
+	key    string
+	value  string
+	pool   *redis.Pool
+	logger *log.Logger
 }
 
 // Acquire the lock.  To interrupt lock acquistion, close stopCh.  The
@@ -150,10 +174,13 @@ func (c *RedisLock) Lock(stopCh <-chan struct{}) (<-chan struct{}, error) {
 	// successful operation.
 	var reply interface{}
 	for reply == nil {
+		conn := c.pool.Get()
+		defer conn.Close()
+
 		// Attempt to set our key.  "NX" means to only set the key
 		// if it does not exist, and "PX" specifies a timeout in
 		// milliseconds.
-		reply, err := (*c.conn).Do("SET", c.key, c.value, "NX", "PX", "30000")
+		reply, err := conn.Do("SET", c.key, c.value, "NX", "PX", "30000")
 		if err != nil {
 			// We got an error communicating with Redis, so
 			// fail outright.
@@ -165,50 +192,93 @@ func (c *RedisLock) Lock(stopCh <-chan struct{}) (<-chan struct{}, error) {
 			break
 		}
 
-		// Create a timeout channel that will send a message after
-		// 5 seconds.
-		timeout := make(chan bool, 1)
-		go func() {
-			time.Sleep(5 * time.Second)
-			timeout <- true
-		}()
-
+		// Wait a while before retrying.
 		select {
 		case <-stopCh:
 			// Lock acquisition was cancelled by our caller.
 			return nil, nil
-		case <-timeout:
+		case <-time.After(5 * time.Second):
 			// Timeout fired, so here we go again.
 		}
 	}
 
-	return make(chan struct{}), nil
-}
+	// Set up a background listener to renew our lock and notice if it
+	// goes away.
+	leaderCh := make(chan struct{})
+	go func() {
+		conn := c.pool.Get()
+		defer conn.Close()
 
-// Release the lock.
-func (c *RedisLock) Unlock() error {
-	unlockScript := redis.NewScript(1, `
-if redis.call("get",KEYS[1]) == ARGV[1] then
-    return redis.call("del",KEYS[1])
+		// Create our TTL-bumping script and try to load
+		// it. Loading is optional because of how Redigo is
+		// implemented.
+		bumpTtlScript := redis.NewScript(1, `
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+    return redis.call("EXPIRE", KEYS[1], "30000")
 else
     return 0
 end
 `)
-	reply, err := unlockScript.Do(*c.conn, c.key, c.value)
+		_ = bumpTtlScript.Load(conn)
+
+		// Renew our TTL periodically.
+		for true {
+			// We could safely sleep for longer than 1 second,
+			// but we're trying to trigger this case from the
+			// test suites.  And fast responses to loss of the
+			// lock are probably a good thing.
+			time.Sleep(1 * time.Second)
+			reply, err := bumpTtlScript.Do(conn, c.key, c.value)
+			result, err := redis.Int(reply, err)
+			if err != nil || result == 0 {
+				close(leaderCh)
+				if err == nil {
+					err = fmt.Errorf("could not bump ttl")
+				}
+				c.logger.Printf("[WARN]: redis: lost lock: %v", err)
+				return
+			}
+		}
+	}()
+
+	return leaderCh, nil
+}
+
+// Release the lock.
+func (c *RedisLock) Unlock() error {
+	conn := c.pool.Get()
+	defer conn.Close()
+
+	// Declare a Redis Lua script that we'll send to the server.  This
+	// will delete our lock key, but only if it contains the value that
+	// we expect.
+	unlockScript := redis.NewScript(1, `
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+    return redis.call("DEL", KEYS[1])
+else
+    return 0
+end
+`)
+
+	// Run our unlock script.
+	reply, err := unlockScript.Do(conn, c.key, c.value)
 	deleted, err := redis.Int(reply, err)
 	if err != nil {
 		return err
 	}
 	if deleted == 0 {
 		// I presume we ought to return an error here.
-		return fmt.Errorf("redis: tried to unlock somebody else's lock")
+		return fmt.Errorf("redis: tried to unlock a lock we didn't own")
 	}
 	return nil
 }
 
 // Returns the value of the lock and if it is held.
 func (c *RedisLock) Value() (bool, string, error) {
-	reply, err := (*c.conn).Do("GET", c.key)
+	conn := c.pool.Get()
+	defer conn.Close()
+
+	reply, err := conn.Do("GET", c.key)
 	if err != nil {
 		// Could not read value.
 		return false, "", err
@@ -221,6 +291,15 @@ func (c *RedisLock) Value() (bool, string, error) {
 	// Somebody is holding the lock, so report the value.
 	value, err := redis.String(reply, err)
 	return true, value, err
+}
+
+// Testing: Simulate an expiration of our lock by deleting our key.
+func (c *RedisLock) simulateExpiration() error {
+	conn := c.pool.Get()
+	defer conn.Close()
+
+	_, err := conn.Do("DEL", c.key)
+	return err
 }
 
 //type Lock interface {
