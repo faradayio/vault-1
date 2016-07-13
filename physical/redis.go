@@ -11,9 +11,20 @@ import (
 	"github.com/garyburd/redigo/redis"
 )
 
-// EtcdBackend is a physical backend that stores data at specific
-// prefix within Etcd. It is used for most production situations as
-// it allows Vault to run on multiple machines in a highly-available manner.
+// RedisBackend is a physical backend that stores data at a specific prefix
+// within Redis.  This is not especially useful as an ordinary
+// secret-storage backend, unless you set up Redis persistence.
+//
+// But this backend offers a relatively simple way to set up a "medium
+// availability" Vault cluster, where you use S3 or another backend for
+// storage, and a single Redis server as a "ha_backend" to handle leader
+// elections.  If the Redis server fails, then all vault servers should go
+// to standby until Redis returns.
+//
+// This is potentially useful because Redis servers are ubiquitous and
+// surprisingly reliable, and because not everybody wants to set up and
+// administer either Consul or etcd for a single leader lock.  Also,
+// high-quality hosted and managed Redis services are widely available.
 type RedisBackend struct {
 	path   string
 	pool   *redis.Pool
@@ -301,17 +312,3 @@ func (c *RedisLock) simulateExpiration() error {
 	_, err := conn.Do("DEL", c.key)
 	return err
 }
-
-//type Lock interface {
-//	// Lock is used to acquire the given lock
-//	// The stopCh is optional and if closed should interrupt the lock
-//	// acquisition attempt. The return struct should be closed when
-//	// leadership is lost.
-//	Lock(stopCh <-chan struct{}) (<-chan struct{}, error)
-//
-//	// Unlock is used to release the lock
-//	Unlock() error
-//
-//	// Returns the value of the lock and if it is held
-//	Value() (bool, string, error)
-//}
