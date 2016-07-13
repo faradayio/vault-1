@@ -129,25 +129,41 @@ func (c *RedisBackend) List(prefix string) ([]string, error) {
 }
 
 func (c *RedisBackend) LockWith(key, value string) (Lock, error) {
-	return nil, fmt.Errorf("RedisBackend LockWith unimplemented")
+	return &RedisLock{
+		key:   key,
+		value: value,
+		conn:  c.conn,
+	}, nil
 }
 
-//type Backend interface {
-//	// Put is used to insert or update an entry
-//	Put(entry *Entry) error
+type RedisLock struct {
+	key   string
+	value string
+	conn  *redis.Conn
+}
+
+func (c *RedisLock) Lock(stopCh <-chan struct{}) (<-chan struct{}, error) {
+	return nil, fmt.Errorf("RedisLock Lock unimplemented")
+}
+
+func (c *RedisLock) Unlock() error {
+	return fmt.Errorf("RedisLock Unlock unimplemented")
+}
+
+func (c *RedisLock) Value() (bool, string, error) {
+	return false, "", fmt.Errorf("RedisLock Value unimplemented")
+}
+
+//type Lock interface {
+//	// Lock is used to acquire the given lock
+//	// The stopCh is optional and if closed should interrupt the lock
+//	// acquisition attempt. The return struct should be closed when
+//	// leadership is lost.
+//	Lock(stopCh <-chan struct{}) (<-chan struct{}, error)
 //
-//	// Get is used to fetch an entry
-//	Get(key string) (*Entry, error)
+//	// Unlock is used to release the lock
+//	Unlock() error
 //
-//	// Delete is used to permanently delete an entry
-//	Delete(key string) error
-//
-//	// List is used ot list all the keys under a given
-//	// prefix, up to the next prefix.
-//	List(prefix string) ([]string, error)
-//}
-//
-//type HABackend interface {
-//	// LockWith is used for mutual exclusion based on the given key.
-//	LockWith(key, value string) (Lock, error)
+//	// Returns the value of the lock and if it is held
+//	Value() (bool, string, error)
 //}

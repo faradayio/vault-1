@@ -10,6 +10,10 @@ import (
 	//"golang.org/x/net/context"
 )
 
+// To run this test, set up a local Redis instance and run:
+//
+//     docker run -p 6379:6379 -d redis
+//     env REDIS_URL=redis://localhost:6379/9 make test TEST=./physical
 func TestRedisBackend(t *testing.T) {
 	addr := os.Getenv("REDIS_URL")
 	if addr == "" {
@@ -17,7 +21,7 @@ func TestRedisBackend(t *testing.T) {
 	}
 
 	randPath := fmt.Sprintf("vault-leader-%d", time.Now().Unix())
-	// TODO: Delete key when done.
+	// TODO: Delete all matching keys when done.
 
 	logger := log.New(os.Stderr, "", log.LstdFlags)
 
