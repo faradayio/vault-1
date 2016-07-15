@@ -37,10 +37,14 @@ func newRedisBackend(conf map[string]string, logger *log.Logger) (Backend, error
 		path = "vault"
 	}
 
-	// Get the Redis URL from our environment.
-	url := os.Getenv("REDIS_URL")
-	if url == "" {
+	// Get the Redis URL from either our config file or our environment.
+	url, ok := conf["url"]
+	if !ok {
 		url = "redis://127.0.0.1:6379"
+	}
+	urlEnv := os.Getenv("REDIS_URL")
+	if urlEnv != "" {
+		url = urlEnv
 	}
 	addr := strings.TrimPrefix(url, "redis://")
 
