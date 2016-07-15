@@ -45,7 +45,8 @@ func newRedisBackend(conf map[string]string, logger *log.Logger) (Backend, error
 	addr := strings.TrimPrefix(url, "redis://")
 
 	// Create a Redis connection pool so that we can access Redis from
-	// multiple goroutines in parallel.
+	// multiple goroutines in parallel.  This was adapted from the
+	// Redigo docs.
 	pool := &redis.Pool{
 		MaxIdle:     2,
 		IdleTimeout: 300 * time.Second,
@@ -130,7 +131,8 @@ func (c *RedisBackend) List(prefix string) ([]string, error) {
 	reply, err := conn.Do("KEYS", realPrefix+"*")
 	matches, err := redis.Strings(reply, err)
 
-	// TODO - Don't recurse subdirectories.  This means stripping
+	// The KEYS command recurses "subdirectories", but we don't want to
+	// return the recursive values in our output.  This means stripping
 	// everything after "/" and removing duplicates.
 	results := make([]string, 0)
 	dirs := make(map[string]bool)
