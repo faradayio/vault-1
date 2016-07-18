@@ -46,7 +46,6 @@ func newRedisBackend(conf map[string]string, logger *log.Logger) (Backend, error
 	if urlEnv != "" {
 		url = urlEnv
 	}
-	addr := strings.TrimPrefix(url, "redis://")
 
 	// Create a Redis connection pool so that we can access Redis from
 	// multiple goroutines in parallel.  This was adapted from the
@@ -55,7 +54,7 @@ func newRedisBackend(conf map[string]string, logger *log.Logger) (Backend, error
 		MaxIdle:     2,
 		IdleTimeout: 300 * time.Second,
 		Dial: func() (redis.Conn, error) {
-			conn, err := redis.Dial("tcp", addr)
+			conn, err := redis.DialURL(url)
 			// TODO: Add AUTH here if we want to support it.
 			return conn, err
 		},
@@ -238,11 +237,11 @@ end
 		_ = bumpTtlScript.Load(conn)
 
 		// Renew our TTL periodically.
-		for true {
+		for {
 			// We could safely sleep for longer than 1 second,
 			// but we're trying to trigger this case from the
-			// test suites.  And fast responses to loss of the
-			// lock are probably a good thing.
+			// test suites, too.  And fast responses to loss of
+			// the lock are probably a good thing.
 			time.Sleep(1 * time.Second)
 			reply, err := bumpTtlScript.Do(conn, c.key, c.value)
 			result, err := redis.Int(reply, err)
