@@ -6,7 +6,7 @@ import (
 	"os"
 	"testing"
 	"time"
-	//"github.com/garyburd/redigo/redis"
+	"github.com/garyburd/redigo/redis"
 )
 
 // To run this test, set up a local Redis instance and run:
@@ -42,6 +42,24 @@ func TestRedisBackend(t *testing.T) {
 	testHABackend(t, ha, ha)
 
 	testRedisHAExpiration(t, ha)
+
+	// Clean up all unit test keys.
+	conn, err := redis.DialURL(addr)
+	defer conn.Close();
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	reply, err := conn.Do("KEYS", randPath+"/*")
+	keys, err := redis.Strings(reply, err)
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	for _, key := range keys {
+		_, err = conn.Do("DEL", key)
+		if err != nil {
+			t.Fatalf("err: %s", err)
+		}
+	}
 }
 
 // Since RedisLock provides a SimulateExpiration method, we can test what
