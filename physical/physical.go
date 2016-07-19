@@ -119,6 +119,7 @@ var builtinBackends = map[string]Factory{
 	"etcd":       newEtcdBackend,
 	"mysql":      newMySQLBackend,
 	"postgresql": newPostgreSQLBackend,
+	"redis":      newRedisBackend,
 	"swift":      newSwiftBackend,
 }
 
