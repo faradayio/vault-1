@@ -3,7 +3,9 @@ package physical
 import (
 	"fmt"
 	"log"
+	"math"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -25,9 +27,33 @@ import (
 // administer either Consul or etcd for a single leader lock.  Also,
 // high-quality hosted and managed Redis services are widely available.
 type RedisBackend struct {
-	path   string
-	pool   *redis.Pool
-	logger *log.Logger
+	path     string
+	pool     *redis.Pool
+	logger   *log.Logger
+	lockConf *RedisLockConfig
+}
+
+// Configuration options for a RedisLock.
+type RedisLockConfig struct {
+	// How long should the leader TTL last?
+	leaderTTL               time.Duration
+	// How long should the leader wait before renewing the TTL?  This
+	// should be no more than half of leaderTTL.
+	leaderTTLRenewInterval  time.Duration
+	// How often should a standby server attempt to take the lock?
+	leaderLockRetryInterval time.Duration
+}
+
+func parseRedisTimeout(conf map[string]string, key string, defaultVal time.Duration) (time.Duration, error) {
+	timeoutStr, ok := conf[key]
+	if !ok {
+		return defaultVal, nil
+	}
+	timeout, err := strconv.Atoi(timeoutStr)
+	if err != nil {
+		return 0, err
+	}
+	return time.Duration(timeout) * time.Millisecond, nil
 }
 
 func newRedisBackend(conf map[string]string, logger *log.Logger) (Backend, error) {
@@ -47,6 +73,23 @@ func newRedisBackend(conf map[string]string, logger *log.Logger) (Backend, error
 		url = urlEnv
 	}
 
+	// Get our lock timeouts.
+	leaderTTL, err := parseRedisTimeout(conf, "leader_ttl", 30*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	leaderTTLRenewInterval, err := parseRedisTimeout(conf, "leader_ttl_renew_interval", 1*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	leaderLockRetryInterval, err := parseRedisTimeout(conf, "leader_lock_retry_interval", 5*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	if 2*leaderTTLRenewInterval > leaderTTL {
+		return nil, fmt.Errorf("leader_ttl_renew_interval must be no more than half of leader_ttl")
+	}
+
 	// Create a Redis connection pool so that we can access Redis from
 	// multiple goroutines in parallel.  This was adapted from the
 	// Redigo docs.
@@ -54,8 +97,9 @@ func newRedisBackend(conf map[string]string, logger *log.Logger) (Backend, error
 		MaxIdle:     2,
 		IdleTimeout: 300 * time.Second,
 		Dial: func() (redis.Conn, error) {
+			// Use DialURL to handle database numbers,
+			// authentication, etc.
 			conn, err := redis.DialURL(url)
-			// TODO: Add AUTH here if we want to support it.
 			return conn, err
 		},
 		TestOnBorrow: func(c redis.Conn, t time.Time) error {
@@ -65,9 +109,14 @@ func newRedisBackend(conf map[string]string, logger *log.Logger) (Backend, error
 	}
 
 	return &RedisBackend{
-		path:   path,
-		pool:   pool,
-		logger: logger,
+		path:     path,
+		pool:     pool,
+		logger:   logger,
+		lockConf: &RedisLockConfig{
+			leaderTTL: leaderTTL,
+			leaderTTLRenewInterval: leaderTTLRenewInterval,
+			leaderLockRetryInterval: leaderLockRetryInterval,
+		},
 	}, nil
 }
 
@@ -165,10 +214,11 @@ func (c *RedisBackend) List(prefix string) ([]string, error) {
 
 func (c *RedisBackend) LockWith(key, value string) (Lock, error) {
 	return &RedisLock{
-		key:    fmt.Sprintf("%s/_lock/%s", c.path, key),
-		value:  value,
-		pool:   c.pool,
-		logger: c.logger,
+		key:      fmt.Sprintf("%s/_lock/%s", c.path, key),
+		value:    value,
+		pool:     c.pool,
+		logger:   c.logger,
+		lockConf: c.lockConf,
 	}, nil
 }
 
@@ -176,15 +226,21 @@ func (c *RedisBackend) LockWith(key, value string) (Lock, error) {
 // example code used to explain Redlock at http://redis.io/topics/distlock
 // but it might be useful to upgrade this to a full Redlock implementation.
 type RedisLock struct {
-	key    string
-	value  string
-	pool   *redis.Pool
-	logger *log.Logger
+	key      string
+	value    string
+	pool     *redis.Pool
+	logger   *log.Logger
+	lockConf *RedisLockConfig
 }
 
 // Acquire the lock.  To interrupt lock acquistion, close stopCh.  The
 // returned channel will be closed if the lock is lost.
 func (c *RedisLock) Lock(stopCh <-chan struct{}) (<-chan struct{}, error) {
+	// Round up leaderTTL to the nearest second and convert to a
+	// string.  We do this because EXPIRE only has 1-second accuracy.
+	ttlSeconds := float64(c.lockConf.leaderTTL) / float64(time.Second);
+	ttlStr := strconv.Itoa(int(math.Ceil(ttlSeconds)));
+
 	// Loop until we get a non-nil reply from Redis indicating a
 	// successful operation.
 	var reply interface{}
@@ -195,7 +251,7 @@ func (c *RedisLock) Lock(stopCh <-chan struct{}) (<-chan struct{}, error) {
 		// Attempt to set our key.  "NX" means to only set the key
 		// if it does not exist, and "EX" specifies a timeout in
 		// seconds.
-		reply, err := conn.Do("SET", c.key, c.value, "NX", "EX", "30")
+		reply, err := conn.Do("SET", c.key, c.value, "NX", "EX", ttlStr)
 		if err != nil {
 			// We got an error communicating with Redis, so
 			// fail outright.
@@ -212,7 +268,7 @@ func (c *RedisLock) Lock(stopCh <-chan struct{}) (<-chan struct{}, error) {
 		case <-stopCh:
 			// Lock acquisition was cancelled by our caller.
 			return nil, nil
-		case <-time.After(5 * time.Second):
+		case <-time.After(c.lockConf.leaderLockRetryInterval):
 			// Timeout fired, so here we go again.
 		}
 	}
@@ -229,7 +285,7 @@ func (c *RedisLock) Lock(stopCh <-chan struct{}) (<-chan struct{}, error) {
 		// implemented.
 		bumpTtlScript := redis.NewScript(1, `
 if redis.call("GET", KEYS[1]) == ARGV[1] then
-    return redis.call("EXPIRE", KEYS[1], "30")
+    return redis.call("EXPIRE", KEYS[1], ARGV[2])
 else
     return 0
 end
@@ -238,12 +294,8 @@ end
 
 		// Renew our TTL periodically.
 		for {
-			// We could safely sleep for longer than 1 second,
-			// but we're trying to trigger this case from the
-			// test suites, too.  And fast responses to loss of
-			// the lock are probably a good thing.
-			time.Sleep(1 * time.Second)
-			reply, err := bumpTtlScript.Do(conn, c.key, c.value)
+			time.Sleep(c.lockConf.leaderTTLRenewInterval)
+			reply, err := bumpTtlScript.Do(conn, c.key, c.value, ttlStr)
 			result, err := redis.Int(reply, err)
 			if err != nil || result == 0 {
 				close(leaderCh)

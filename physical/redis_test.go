@@ -26,6 +26,7 @@ func TestRedisBackend(t *testing.T) {
 
 	b, err := NewBackend("redis", logger, map[string]string{
 		"path": randPath,
+		"leader_ttl_renew_interval": "100",
 	})
 	if err != nil {
 		t.Fatalf("err: %s", err)
